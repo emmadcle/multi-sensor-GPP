@@ -36,9 +36,9 @@ Applies pre-trained GPR models to generate daily GPP estimates ($gC \, m^{-2} \,
 ---
 
 ## Requirements
-* A [Google Earth Engine](https://earthengine.google.com/) account.
+* A Google Earth Engine account.
 * R environment with the `rgee` package installed and authenticated.
-* Pre-trained GPR model objects (provided in the `/models` directory).
+* Pre-trained GPR models (provided in ZENODO directory).
 
 ---
 
