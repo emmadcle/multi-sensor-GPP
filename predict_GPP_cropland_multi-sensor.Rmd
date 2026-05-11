@@ -1,0 +1,782 @@
+---
+title: "get_everything"
+author: "Emma De Clerck"
+date: "2026-03-23"
+output: html_document
+---
+
+
+```{r}
+library(dplyr)
+library(purrr)
+library(tibble)
+library(reticulate)
+library(rgee)
+```
+
+
+
+```{r}
+# =============================================================================
+# USER INPUTS — edit these before running
+# =============================================================================
+
+LAT          <- 36.6058          # decimal degrees (e.g., US-ARM)
+LON          <- -97.4888         # decimal degrees (e.g., US-ARM)
+BUFFER_M     <- 100              # buffer radius in meters (applied to all sources)
+DATE_START   <- as.Date("2022-01-01")
+DATE_END     <- as.Date("2022-12-31")
+OUTPUT_PATH  <- "."              # folder where the CSV will be saved
+OUTPUT_FILE  <- "harmonized_dataset_test_US-ARM.csv"
+
+
+# Paths to the three GPR model .txt files (download from Zenodo)
+MODEL_PATH_S1   <- "~models/GPP_S1_model_R.txt"      # Aux + VV + VH
+MODEL_PATH_S2   <- "~models/GPP_S2_model_R.txt"      # Aux + B2-B12
+MODEL_PATH_S1S2 <- "~models/GPP_S1S2_model_R.txt"    # Aux + VV + VH + B2-B12
+
+
+# Project name of Google Earth Engine
+GEE_PROJECT <- "ee-yourproject"                       # change to your project
+
+```
+
+
+```{r}
+# =============================================================================
+# GEE HARMONIZED RETRIEVAL PIPELINE
+# Sources: DEM → SOIL → METEO → S1 (optional) → S2 (optional)
+# Output:  one CSV with one row per date, static layers repeated per row
+# =============================================================================
+
+
+# =============================================================================
+# GEE CONNECTION
+# =============================================================================
+
+# Use your virtualenv
+use_virtualenv("~/.virtualenvs/r-reticulate", required = TRUE)
+
+py_config()
+
+# OPTIONAL but recommended:
+# upgrade earthengine-api
+py_install(
+  "earthengine-api",
+  pip = TRUE,
+  pip_options = "--upgrade"
+)
+
+library(rgee)
+
+# Remove old credentials
+ee_clean_user_credentials()
+
+# Authenticate using localhost mode
+ee_Authenticate(auth_mode = "localhost")
+
+# Initialize with your project
+ee_Initialize(
+  project = GEE_PROJECT 
+)
+
+
+
+# =============================================================================
+# SETUP
+# =============================================================================
+
+# Full date sequence (one row per day)
+dates <- seq(DATE_START, DATE_END, by = "day")
+
+# Convenience: GEE point + buffer geometry (used by METEO, S1, S2)
+pt_wgs84  <- ee$Geometry$Point(c(LON, LAT))
+region    <- pt_wgs84$buffer(BUFFER_M)$bounds()
+
+# =============================================================================
+# 1. DEM  —  static, fetched once
+# =============================================================================
+
+get_dem <- function(lat, lon, buffer_m) {
+  message(">>> Fetching DEM ...")
+  pt     <- ee$Geometry$Point(c(lon, lat))
+  buf    <- pt$buffer(buffer_m)$bounds()
+
+  dem_image <- ee$ImageCollection("COPERNICUS/DEM/GLO30")$mosaic()$
+    select("DEM")$rename("elevation")
+  terrain   <- ee$Terrain$products(dem_image)
+
+  vals <- terrain$reduceRegion(
+    reducer   = ee$Reducer$mean(),
+    geometry  = buf,
+    scale     = 30,
+    maxPixels = 1e8
+  )$getInfo()
+
+  tibble(
+    Elevation_m = vals$elevation %||% NA_real_,
+    Slope_deg   = vals$slope     %||% NA_real_,
+    Aspect_deg  = vals$aspect    %||% NA_real_,
+    Hillshade   = vals$hillshade %||% NA_real_
+  )
+}
+
+dem_row <- tryCatch(
+  get_dem(LAT, LON, BUFFER_M),
+  error = function(e) {
+    message("DEM failed: ", e$message)
+    tibble(Elevation_m = NA_real_, Slope_deg = NA_real_,
+           Aspect_deg  = NA_real_, Hillshade = NA_real_)
+  }
+)
+
+# =============================================================================
+# 2. SOIL  —  static, fetched once, averaged over 0-30 cm depth layers
+# =============================================================================
+
+get_soil <- function(lat, lon) {
+  message(">>> Fetching SOIL ...")
+  pt_wgs84 <- ee$Geometry$Point(c(lon, lat))
+
+  layer_names <- c("bdod_mean", "cec_mean", "cfvo_mean", "clay_mean",
+                   "nitrogen_mean", "ocd_mean", "ocs_mean", "phh2o_mean",
+                   "sand_mean", "silt_mean", "soc_mean")
+
+  layers <- set_names(
+    map(layer_names, ~ ee$Image(paste0("projects/soilgrids-isric/", .x))),
+    nm = sub("_mean$", "", layer_names)
+  )
+
+  proj    <- layers[[1]]$projection()
+  pt_proj <- pt_wgs84$transform(proj, 1)
+
+  extract_band_values <- function(image, prefix) {
+    val <- image$reduceRegion(
+      reducer   = ee$Reducer$first(),
+      geometry  = pt_proj,
+      scale     = 250,
+      maxPixels = 1e9
+    )$getInfo()
+    if (is.null(val)) {
+      band_names <- image$bandNames()$getInfo()
+      val <- as.list(rep(NA_real_, length(band_names)))
+      names(val) <- band_names
+    }
+    as_tibble(val) %>% set_names(paste0(prefix, "_", names(.)))
+  }
+
+  raw <- imap(layers, extract_band_values) %>% bind_cols()
+
+  # Variables and depth suffixes present in SoilGrids band names
+  variables <- c("bdod","cec","clay","sand","silt","nitrogen","phh2o","soc","ocd","ocs")
+  depths    <- c("0-5cm","5-15cm","15-30cm","0-30cm")
+
+  avg_var <- function(var) {
+    cols <- intersect(
+      paste0(var, "_", var, "_", depths, "_mean"),
+      names(raw)
+    )
+    if (length(cols) == 0) return(NA_real_)
+    mean(unlist(raw[cols]), na.rm = TRUE)
+  }
+
+  # Scaling factors (divide raw integer values)
+  sf <- c(bdod=100, cec=10, clay=10, sand=10, silt=10,
+          nitrogen=100, phh2o=10, soc=10, ocd=10, ocs=10)
+
+  soil_vals <- map_dbl(set_names(variables, variables), avg_var)
+
+  tibble(
+    bdod_mean     = soil_vals["bdod"]     / sf["bdod"],
+    cec_mean      = soil_vals["cec"]      / sf["cec"],
+    clay_mean     = soil_vals["clay"]     / sf["clay"],
+    sand_mean     = soil_vals["sand"]     / sf["sand"],
+    silt_mean     = soil_vals["silt"]     / sf["silt"],
+    nitrogen_mean = soil_vals["nitrogen"] / sf["nitrogen"],
+    phh2o_mean    = soil_vals["phh2o"]    / sf["phh2o"],
+    soc_mean      = soil_vals["soc"]      / sf["soc"],
+    ocd_mean      = soil_vals["ocd"]      / sf["ocd"],
+    ocs_mean      = soil_vals["ocs"]      / sf["ocs"]
+  )
+}
+
+soil_row <- tryCatch(
+  get_soil(LAT, LON),
+  error = function(e) {
+    message("SOIL failed: ", e$message)
+    tibble(bdod_mean=NA, cec_mean=NA, clay_mean=NA, sand_mean=NA, silt_mean=NA,
+           nitrogen_mean=NA, phh2o_mean=NA, soc_mean=NA, ocd_mean=NA, ocs_mean=NA)
+  }
+)
+
+# =============================================================================
+# 3. METEO  —  daily ERA5-Land, one row per date
+# =============================================================================
+
+get_meteo_day <- function(lat, lon, date) {
+  date_char <- format(date, "%Y-%m-%d")
+  next_date <- format(date + 1, "%Y-%m-%d")
+  pt        <- ee$Geometry$Point(c(lon, lat))
+
+  img <- ee$ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")$
+    filterDate(date_char, next_date)$first()
+
+  pull <- function(band) {
+    img$select(band)$reduceRegion(ee$Reducer$mean(), pt, 10000)$get(band)$getInfo()
+  }
+
+  raw <- list(
+    t2m_min  = pull("temperature_2m_min"),
+    t2m_max  = pull("temperature_2m_max"),
+    t2m      = pull("temperature_2m"),
+    dewp     = pull("dewpoint_temperature_2m"),
+    precip   = pull("total_precipitation_sum"),
+    srad     = pull("surface_net_solar_radiation_sum"),
+    therm    = pull("surface_net_thermal_radiation_sum"),
+    sensible = pull("surface_sensible_heat_flux_sum"),
+    latent   = pull("surface_latent_heat_flux_sum"),
+    stmin    = pull("soil_temperature_level_1_min"),
+    stmax    = pull("soil_temperature_level_1_max"),
+    swc      = pull("volumetric_soil_water_layer_1"),
+    snowd    = pull("snow_depth"),
+    snowf    = pull("snowfall_sum"),
+    u10      = pull("u_component_of_wind_10m"),
+    v10      = pull("v_component_of_wind_10m")
+  )
+
+  # Unit conversions
+  TMEAN_C   <- (raw$t2m   %||% NA) - 273.15
+  Dewp_C    <- (raw$dewp  %||% NA) - 273.15
+  es        <- 0.6108 * exp((17.27 * TMEAN_C)  / (TMEAN_C  + 237.3))
+  ea        <- 0.6108 * exp((17.27 * Dewp_C)   / (Dewp_C   + 237.3))
+
+  tibble(
+    date               = date,
+    TMIN_C             = (raw$t2m_min  %||% NA) - 273.15,
+    TMAX_C             = (raw$t2m_max  %||% NA) - 273.15,
+    TMEAN_C            = TMEAN_C,
+    Dewpoint_C         = Dewp_C,
+    RAIN_mm            = (raw$precip   %||% NA) * 1000,
+    SRAD_NET_MJm2      = (raw$srad     %||% NA) / 1e6,
+    THERMAL_NET_MJm2   = (raw$therm    %||% NA) / 1e6,
+    SENSIBLE_HEAT_MJm2 = (raw$sensible %||% NA) / 1e6,
+    LATENT_HEAT_MJm2   = (raw$latent   %||% NA) / 1e6,
+    SoilTemp_min_C     = (raw$stmin    %||% NA) - 273.15,
+    SoilTemp_max_C     = (raw$stmax    %||% NA) - 273.15,
+    SoilWater_m3m3     =  raw$swc      %||% NA,
+    SnowDepth_cm       = (raw$snowd    %||% NA) * 100,
+    Snowfall_mm        = (raw$snowf    %||% NA) * 1000,
+    Wind_m_s           = sqrt(((raw$u10 %||% NA)^2) + ((raw$v10 %||% NA)^2)),
+    VPD_kPa            = pmax(es - ea, 0, na.rm = TRUE)
+  )
+}
+
+message(">>> Fetching METEO (", length(dates), " days) ...")
+meteo_df <- map_dfr(dates, function(d) {
+  tryCatch(
+    get_meteo_day(LAT, LON, d),
+    error = function(e) {
+      message("METEO failed for ", d, ": ", e$message)
+      tibble(date = d,
+             TMIN_C=NA, TMAX_C=NA, TMEAN_C=NA, Dewpoint_C=NA,
+             RAIN_mm=NA, SRAD_NET_MJm2=NA, THERMAL_NET_MJm2=NA,
+             SENSIBLE_HEAT_MJm2=NA, LATENT_HEAT_MJm2=NA,
+             SoilTemp_min_C=NA, SoilTemp_max_C=NA, SoilWater_m3m3=NA,
+             SnowDepth_cm=NA, Snowfall_mm=NA, Wind_m_s=NA, VPD_kPa=NA)
+    }
+  )
+})
+
+# =============================================================================
+# 4. S1 (optional)  —  daily, VV + VH only
+# =============================================================================
+
+get_s1_day <- function(lat, lon, date, buf_geom) {
+  date_str  <- format(date, "%Y-%m-%d")
+  next_date <- format(date + 1, "%Y-%m-%d")
+
+  s1 <- ee$ImageCollection("COPERNICUS/S1_GRD")$
+    filterBounds(buf_geom)$
+    filterDate(date_str, next_date)
+
+  if (s1$size()$getInfo() == 0) return(tibble(date = date, VV = NA_real_, VH = NA_real_))
+
+  img <- s1$first()
+  has_band <- function(b) img$bandNames()$contains(b)$getInfo()
+  pull_band <- function(b) {
+    if (!has_band(b)) return(NA_real_)
+    img$select(b)$reduceRegion(ee$Reducer$mean(), buf_geom, 10, maxPixels=1e8)$getInfo()[[b]]
+  }
+
+  tibble(date = date, VV = pull_band("VV"), VH = pull_band("VH"))
+}
+
+message(">>> Fetching S1 ...")
+s1_df <- map_dfr(dates, function(d) {
+  tryCatch(
+    get_s1_day(LAT, LON, d, region),
+    error = function(e) {
+      message("S1 failed for ", d, ": ", e$message)
+      tibble(date = d, VV = NA_real_, VH = NA_real_)
+    }
+  )
+})
+
+# Check if S1 has ANY valid observation over the full period
+s1_available <- any(!is.na(s1_df$VV) | !is.na(s1_df$VH))
+
+# =============================================================================
+# 5. S2 (optional)  —  daily, all bands + cloud probability
+# =============================================================================
+
+get_s2_day <- function(lat, lon, date, buf_geom) {
+  date_str  <- format(date, "%Y-%m-%d")
+  next_date <- format(date + 1, "%Y-%m-%d")
+
+  s2_sr <- ee$ImageCollection("COPERNICUS/S2_SR_HARMONIZED")$
+    filterBounds(buf_geom)$filterDate(date_str, next_date)
+  s2_cp <- ee$ImageCollection("COPERNICUS/S2_CLOUD_PROBABILITY")$
+    filterBounds(buf_geom)$filterDate(date_str, next_date)
+
+  joined <- ee$Join$inner()$apply(
+    s2_sr, s2_cp,
+    ee$Filter$equals(leftField = "system:index", rightField = "system:index")
+  )
+
+  na_row <- tibble(date = date,
+                   B2=NA, B3=NA, B4=NA, B5=NA, B6=NA, B7=NA,
+                   B8=NA, B8A=NA, B11=NA, B12=NA, cloud_probability=NA)
+
+  if (joined$size()$getInfo() == 0) return(na_row)
+
+  first_pair  <- joined$first()
+  img_sr      <- ee$Image(first_pair$get("primary"))
+  img_cp      <- ee$Image(first_pair$get("secondary"))
+  bands       <- c("B2","B3","B4","B5","B6","B7","B8","B8A","B11","B12")
+
+  refl <- img_sr$select(bands)$reduceRegion(
+    reducer = ee$Reducer$mean(), geometry = buf_geom, scale = 10, maxPixels = 1e8
+  )$getInfo()
+
+  cloud <- img_cp$select("probability")$reduceRegion(
+    reducer = ee$Reducer$mean(), geometry = buf_geom, scale = 10, maxPixels = 1e8
+  )$get("probability")$getInfo()
+
+  tibble(
+    date             = date,
+    B2               = refl$B2   %||% NA, B3  = refl$B3  %||% NA,
+    B4               = refl$B4   %||% NA, B5  = refl$B5  %||% NA,
+    B6               = refl$B6   %||% NA, B7  = refl$B7  %||% NA,
+    B8               = refl$B8   %||% NA, B8A = refl$B8A %||% NA,
+    B11              = refl$B11  %||% NA, B12 = refl$B12 %||% NA,
+    cloud_probability = cloud    %||% NA
+  )
+}
+
+message(">>> Fetching S2 ...")
+s2_df <- map_dfr(dates, function(d) {
+  tryCatch(
+    get_s2_day(LAT, LON, d, region),
+    error = function(e) {
+      message("S2 failed for ", d, ": ", e$message)
+      tibble(date = d,
+             B2=NA, B3=NA, B4=NA, B5=NA, B6=NA, B7=NA,
+             B8=NA, B8A=NA, B11=NA, B12=NA, cloud_probability=NA)
+    }
+  )
+})
+
+s2_available <- any(!is.na(s2_df$B2))
+
+# =============================================================================
+# 6. MERGE  —  DEM + SOIL (static) broadcast over all dates,
+#              then left-join METEO, then conditionally S1, S2
+# =============================================================================
+
+message(">>> Merging all sources ...")
+
+# Static backbone: one row per date with DEM + SOIL repeated
+static_df <- tibble(
+  date = dates,
+  lat  = LAT,
+  lon  = LON
+) %>%
+  bind_cols(dem_row[rep(1, length(dates)), ]) %>%
+  bind_cols(soil_row[rep(1, length(dates)), ])
+
+# Join METEO (always present)
+merged <- static_df %>%
+  left_join(meteo_df, by = "date")
+
+# Conditionally join S1
+if (s1_available) {
+  message(">>> S1 data found — adding VV, VH columns.")
+  merged <- merged %>% left_join(s1_df, by = "date")
+} else {
+  message(">>> No S1 data available for this period/location — columns omitted.")
+}
+
+# Conditionally join S2
+if (s2_available) {
+   message(">>> S2 data found — adding band + cloud_probability columns.")
+  merged <- merged %>% left_join(s2_df, by = "date")
+} else {
+  message(">>> No S2 data available for this period/location — columns omitted.")
+}
+
+# =============================================================================
+# 7. EXPORT
+# =============================================================================
+
+out_file <- file.path(OUTPUT_PATH, OUTPUT_FILE)
+write.csv(merged, file = out_file, row.names = FALSE)
+message(">>> Done! CSV saved to: ", out_file)
+message("    Rows : ", nrow(merged))
+message("    Cols : ", ncol(merged))
+message("    S1   : ", if (s1_available) "included" else "omitted")
+message("    S2   : ", if (s2_available) "included" else "omitted")
+```
+
+
+
+```{r}
+# =============================================================================
+# LOAD MODELS (this might take a while)
+# =============================================================================
+
+load_model <- function(model_path, model_name) {
+  # Source into a fresh temporary environment to avoid GlobalEnv collisions
+  # and the "negative length vectors" error that occurs when large matrix
+  # assignments are parsed directly into .GlobalEnv via source()
+  tmp_env   <- new.env(parent = baseenv())
+  sys.source(model_path, envir = tmp_env, keep.source = FALSE)
+  model_obj <- as.list(tmp_env)
+  assign(model_name, model_obj, envir = .GlobalEnv)
+  message("Loaded model: ", model_name, " (", length(model_obj), " components)")
+}
+ 
+load_model(MODEL_PATH_S1,   "GPPmodel_s1")
+load_model(MODEL_PATH_S2,   "GPPmodel_s2")
+load_model(MODEL_PATH_S1S2, "GPPmodel_s1s2")
+ 
+```
+
+
+
+```{r}
+# =============================================================================
+# GPR APPLICATION PIPELINE
+# Applies one of three pre-trained GPR models per row depending on data
+# availability: S1-only | S2-only | S1+S2
+# Input:  harmonized_dataset.csv  (output of gee_retrieval_pipeline.R)
+# Output: gpp_predictions.csv
+
+# =============================================================================
+# USER INPUTS
+# =============================================================================
+
+INPUT_CSV   <- "harmonized_dataset_test_US-ARM.csv"   # path to retrieval pipeline output
+OUTPUT_CSV  <- "gpp_predictions_US-ARM.csv"
+TARGET_VAR  <- "GPP"                      # used for output column naming
+CLOUD_THRESH <- 30
+
+
+# =============================================================================
+# FEATURE ORDER  (must match training exactly)
+# =============================================================================
+
+# Aux block: SOIL → DEM → METEO (28 features)
+AUX_COLS <- c(
+  # SOIL
+  "bdod_mean", "cec_mean", "clay_mean", "sand_mean", "silt_mean",
+  "nitrogen_mean", "phh2o_mean", "soc_mean", "ocd_mean", "ocs_mean",
+  # DEM
+  "Elevation_m", "Slope_deg", "Aspect_deg", "Hillshade",
+  # METEO
+  "TMIN_C", "TMAX_C", "TMEAN_C", "Dewpoint_C", "RAIN_mm",
+  "SRAD_NET_MJm2", "THERMAL_NET_MJm2", "SENSIBLE_HEAT_MJm2",
+  "LATENT_HEAT_MJm2", "SoilTemp_min_C", "SoilTemp_max_C",
+  "SoilWater_m3m3", "Wind_m_s", "VPD_kPa"
+)
+
+S1_COLS   <- c("VV", "VH")
+S2_COLS   <- c("B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12")
+
+# Full feature vectors per model (order matters for GPR algebra)
+FEATURES_S1   <- c(AUX_COLS, S1_COLS)                     # 30 features
+FEATURES_S2   <- c(AUX_COLS, S2_COLS)                     # 38 features
+FEATURES_S1S2 <- c(AUX_COLS, S1_COLS, S2_COLS)            # 40 features
+
+# =============================================================================
+# SETUP
+# =============================================================================
+
+library(dplyr)
+
+df <- read.csv(INPUT_CSV, stringsAsFactors = FALSE)
+df$date <- as.Date(df$date)
+
+# Detect which optional column blocks are present in the CSV
+has_s1_cols <- all(S1_COLS %in% names(df))
+has_s2_cols <- all(S2_COLS %in% names(df))
+
+message("S1 columns present in CSV : ", has_s1_cols)
+message("S2 columns present in CSV : ", has_s2_cols)
+
+# =============================================================================
+# HELPER: check if a row has valid (non-NA) values for a set of columns
+# =============================================================================
+
+row_has <- function(row, cols) {
+  if (!all(cols %in% names(row))) return(FALSE)
+  all(!is.na(row[cols]))
+}
+
+# =============================================================================
+# GPR PREDICT  — generalised version of your original function
+#
+# Expects model to contain components named with a shared suffix, e.g.:
+#   hyp_ell_<suffix>, mx_<suffix>, sx_<suffix>, X_train_<suffix>,
+#   mean_model_<suffix>, hyp_sig_<suffix>, XDX_pre_calc_<suffix>,
+#   alpha_coefficients_<suffix>, Linv_pre_calc_<suffix>
+#
+# The suffix is detected automatically from the model object names.
+# =============================================================================
+
+gpr_predict <- function(feature_vector, model) {
+
+  # --- detect suffix from model object keys ---------------------------------
+  keys   <- names(model)
+  suffix <- sub("^hyp_ell_", "", keys[grepl("^hyp_ell_", keys)][1])
+
+  # --- pull model components ------------------------------------------------
+  hyp_ell    <- model[[paste0("hyp_ell_",           suffix)]]
+  mx         <- model[[paste0("mx_",                suffix)]]
+  sx         <- model[[paste0("sx_",                suffix)]]
+  X_train    <- model[[paste0("X_train_",           suffix)]]
+  mean_model <- model[[paste0("mean_model_",        suffix)]]
+  hyp_sig    <- model[[paste0("hyp_sig_",           suffix)]]
+  XDX        <- model[[paste0("XDX_pre_calc_",      suffix)]]
+  alpha      <- as.vector(model[[paste0("alpha_coefficients_", suffix)]])
+  Linv       <- model[[paste0("Linv_pre_calc_",     suffix)]]
+
+  n_feat <- length(feature_vector)
+
+  if (length(hyp_ell) != n_feat)
+    stop(sprintf("Feature length mismatch: got %d, model expects %d",
+                 n_feat, length(hyp_ell)))
+
+  # --- GPR algebra (matches your original implementation) -------------------
+  x_arr           <- array(feature_vector, dim = c(n_feat, 1, 1))
+  mx_arr          <- array(mx,             dim = c(n_feat, 1, 1))
+  sx_arr          <- array(sx,             dim = c(n_feat, 1, 1))
+  hyp_ell_arr     <- array(hyp_ell,        dim = c(n_feat, 1, 1))
+
+  x_norm          <- (x_arr - mx_arr) / sx_arr
+  x_norm_ell      <- x_norm * hyp_ell_arr
+
+  PtTPt           <- as.vector(colSums(x_norm_ell * x_norm) * (-0.5))
+  PtTDX           <- as.vector(X_train %*% array(x_norm_ell, dim = c(n_feat, 1)))
+
+  arg1            <- exp(PtTPt) * hyp_sig
+  k_star          <- exp(PtTDX - (XDX * 0.5))
+
+  mean_pred       <- sum(k_star * alpha) * arg1 + mean_model
+  mean_pred       <- max(mean_pred, 0)
+
+  k_star_unc      <- k_star * arg1
+  Vvec            <- Linv %*% k_star_unc
+  variance        <- sqrt(abs(hyp_sig - sum(Vvec^2)))
+
+  list(mean_pred = mean_pred, variance = variance)
+}
+
+# =============================================================================
+# MAIN LOOP
+# =============================================================================
+
+
+
+results <- vector("list", nrow(df))
+
+for (i in seq_len(nrow(df))) {
+
+  row <- df[i, , drop = FALSE]
+
+  # Determine which model to use based on data availability for this row
+  s1_ok  <- has_s1_cols && row_has(row, S1_COLS)
+  s2_ok  <- has_s2_cols && row_has(row, S2_COLS)
+  aux_ok <- row_has(row, AUX_COLS)
+
+  model_used <- NA_character_
+  pred       <- NA_real_
+  unc        <- NA_real_
+
+  if (!aux_ok) {
+    message(sprintf("Row %d (%s): Aux features incomplete — skipping.", i, row$date))
+
+  } else if (s1_ok && s2_ok) {
+    # --- S1 + S2 model ------------------------------------------------------
+    tryCatch({
+      fv         <- as.numeric(row[FEATURES_S1S2])
+      out        <- gpr_predict(fv, GPPmodel_s1s2)
+      pred       <- out$mean_pred
+      unc        <- out$variance
+      model_used <- "S1+S2"
+    }, error = function(e) {
+      message(sprintf("Row %d (%s) S1+S2 model failed: %s", i, row$date, e$message))
+    })
+
+  } else if (s2_ok) {
+    # --- S2-only model ---
+    if (!is.na(row$cloud_probability) && row$cloud_probability > CLOUD_THRESH) {
+        message(sprintf("Row %d (%s): S2 too cloudy — skipping S2 model.", i, row$date))
+    } else {
+        tryCatch({
+            fv         <- as.numeric(row[FEATURES_S2])
+            out        <- gpr_predict(fv, GPPmodel_s2)
+            pred       <- out$mean_pred
+            unc        <- out$variance
+            model_used <- "S2"
+        }, error = function(e) {
+            message(sprintf("Row %d (%s) S2 model failed: %s", i, row$date, e$message))
+        })
+    }
+
+  } else if (s1_ok) {
+    # --- S1-only model ------------------------------------------------------
+    tryCatch({
+      fv         <- as.numeric(row[FEATURES_S1])
+      out        <- gpr_predict(fv, GPPmodel_s1)
+      pred       <- out$mean_pred
+      unc        <- out$variance
+      model_used <- "S1"
+    }, error = function(e) {
+      message(sprintf("Row %d (%s) S1 model failed: %s", i, row$date, e$message))
+    })
+
+  } else {
+    message(sprintf("Row %d (%s): No S1 or S2 data — skipping.", i, row$date))
+  }
+
+  results[[i]] <- data.frame(
+    date                          = row$date,
+    lat                           = row$lat,
+    lon                           = row$lon,
+    model_used                    = model_used,
+    stringsAsFactors              = FALSE
+  )
+  results[[i]][[paste0(TARGET_VAR, "_pred")]] <- pred
+  results[[i]][[paste0(TARGET_VAR, "_unc")]]  <- unc
+}
+
+# =============================================================================
+# COMBINE & SAVE
+# =============================================================================
+
+results_df <- dplyr::bind_rows(results)
+
+# Summary
+total     <- nrow(results_df)
+n_s1s2    <- sum(results_df$model_used == "S1+S2", na.rm = TRUE)
+n_s2      <- sum(results_df$model_used == "S2",    na.rm = TRUE)
+n_s1      <- sum(results_df$model_used == "S1",    na.rm = TRUE)
+n_skipped <- sum(is.na(results_df$model_used))
+
+message("\n========== PREDICTION SUMMARY ==========")
+message(sprintf("  Total rows   : %d", total))
+message(sprintf("  S1+S2 model  : %d rows", n_s1s2))
+message(sprintf("  S2 model     : %d rows", n_s2))
+message(sprintf("  S1 model     : %d rows", n_s1))
+message(sprintf("  Skipped (NA) : %d rows", n_skipped))
+message("=========================================\n")
+
+write.csv(results_df, file = OUTPUT_CSV, row.names = FALSE)
+message("Predictions saved to: ", OUTPUT_CSV)
+
+```
+
+
+```{r}
+# =============================================================================
+# VISUALISATION
+# =============================================================================
+ 
+library(ggplot2)
+
+# Prepare plot data — only rows with a valid prediction
+plot_df <- results_df %>%
+  dplyr::filter(!is.na(.data[[paste0(TARGET_VAR, "_pred")]])) %>%
+  dplyr::mutate(
+    date       = as.Date(date),
+    pred       = .data[[paste0(TARGET_VAR, "_pred")]],
+    unc        = .data[[paste0(TARGET_VAR, "_unc")]],
+    ymin       = pred - unc,
+    ymax       = pred + unc,
+    model_used = factor(model_used, levels = c("S1", "S2", "S1+S2"))
+  )
+ 
+# Colour palette per model type
+model_colours <- c(
+  "S1"    = "blue",   # orange
+  "S2"    = "red",   # blue
+  "S1+S2" = "purple"    # green
+)
+ 
+p <- ggplot(plot_df, aes(x = date)) +
+ 
+  # Uncertainty errorbars
+  geom_errorbar(
+  aes(ymin = ymin, ymax = ymax, colour = model_used),
+  width = 0.2,        # controls horizontal cap width
+  linewidth = 0.4,
+  alpha = 0.7
+) +
+ 
+  # Prediction line connecting all points
+  geom_line(
+    aes(y = pred),
+    colour = "grey40", linewidth = 0.4, linetype = "dashed"
+  ) +
+ 
+  # Coloured points per model type
+  geom_point(
+    aes(y = pred, colour = model_used, shape = model_used),
+    size = 2.8, stroke = 0.3
+  ) +
+ 
+  scale_colour_manual(values = model_colours, name = "Model") +
+  scale_fill_manual(values   = model_colours, name = "Model") +
+  scale_shape_manual(
+    values = c("S1" = 17, "S2" = 16, "S1+S2" = 15),
+    name   = "Model"
+  ) +
+ 
+  scale_x_date(date_breaks = "1 month", date_labels = "%b %Y") +
+ 
+  labs(
+    #title    = paste(TARGET_VAR, "predictions from GPR"),
+    subtitle = sprintf(
+      "S1: %d days  |  S2: %d days  |  S1+S2: %d days",
+      n_s1, n_s2, n_s1s2, n_skipped
+    ),
+    x       = "Date",
+    y       = paste0(TARGET_VAR, " (predicted)"),
+    #caption = "Ribbon = pred \u00b1 uncertainty"
+  ) +
+ 
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    plot.subtitle    = element_text(size = 9, colour = "grey40"),
+        legend.position  = "bottom",
+    legend.title     = element_text(face = "bold"),
+    axis.text.x      = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+ 
+print(p)
+
+```
+
+
